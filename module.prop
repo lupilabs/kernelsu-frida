@@ -1,0 +1,6 @@
+id=kernelsu-frida
+name=KernelSU Frida Control
+version=1.0
+versionCode=1
+author=Lupilabs
+description=A simple KernelSU module to download control Frida-server.

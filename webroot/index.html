@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>KernelSU Frida Control</title>
+    <link rel="stylesheet" href="/src/style.css">
+</head>
+<body>
+    <main>
+        <h1>Frida Server Control</h1>
+
+        <!-- Frida Status & Toggle -->
+        <div>
+            <h2>Frida Server</h2>
+            <label for="fridaToggle">
+                <input type="checkbox" id="fridaToggle" role="switch">
+                Enable Frida Server
+            </label>
+            <p id="fridaStatus">Checking...</p>
+        </div>
+
+        <!-- Rename Frida & Change Port -->
+        <div>
+            <h2>Frida Server Settings</h2>
+            <label>Current Name:</label>
+            <input type="text" id="fridaName" placeholder="frida-server">
+
+            <label>Frida Port:</label>
+            <input type="number" id="fridaPort" placeholder="27042">
+
+            <button id="renameFrida">Apply Changes</button>
+        </div>
+
+        <!-- Frida Version Check -->
+        <div>
+            <h2>Update Frida</h2>
+            <p>Current: <span id="currentVersion">Checking...</span></p>
+            <p>Latest: <span id="latestVersion">Checking...</span></p>
+            <button id="updateFrida" disabled>Update Frida</button>
+        </div>
+
+        <!-- Debug Output -->
+        <div>
+            <h2>Logs</h2>
+            <pre id="debugOutput">Checking...</pre>
+        </div>
+    </main>
+
+    <script type="module" src="/src/main.js"></script>
+</body>
+</html>

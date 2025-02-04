@@ -5,7 +5,7 @@ LOCAL_DIST="dist"
 TMP_DIR="/data/local/tmp/dist"
 MODULE_DIR="/data/adb/modules/kernelsu-frida"
 WEBROOT="$MODULE_DIR/webroot"
-MODULE_PROP="src/module.prop"
+MODULE_PROP="module.prop"
 
 echo "🚀 Starting deployment..."
 

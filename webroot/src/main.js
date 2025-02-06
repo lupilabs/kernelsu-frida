@@ -1,195 +1,314 @@
 import * as KernelSU from "kernelsu";
 
-// ✅ Select elements
-const toggleSwitch = document.getElementById("fridaToggle");
-const statusElement = document.getElementById("fridaStatus");
-const updateButton = document.getElementById("updateFrida");
-const debugElement = document.getElementById("debugOutput");
+// Global working variables
+let workingFolder = null;      // e.g. "/data/local/tmp/adirf27042"
+let currentPort = null;        // e.g. "27042"
+let currentServerName = null;  // e.g. "frida-server" or a custom name like "rndserver"
 
-// ✅ Utility: Log to WebView
+// DOM elements
+const toggleSwitch   = document.getElementById("fridaToggle");
+const statusElement  = document.getElementById("fridaStatus");
+const updateButton   = document.getElementById("updateFrida");
+const debugElement   = document.getElementById("debugOutput");
+const fridaNameInput = document.getElementById("fridaName");
+const fridaPortInput = document.getElementById("fridaPort");
+
+// Utility logging function
 const log = (msg) => {
-    debugElement.innerText += `\n${msg}`;
+  debugElement.innerText += `\n${msg}`;
 };
 
-// ✅ Helper: Check if a file exists using KernelSU.exec
+// Helper: Check if a file exists via KernelSU.exec
 const checkFileExists = async (filePath) => {
-    const { stdout } = await KernelSU.exec(`[ -f ${filePath} ] && echo "EXISTS" || echo "MISSING"`);
-    return stdout.trim() === "EXISTS";
+  const { stdout } = await KernelSU.exec(
+    `su -c "[ -f '${filePath}' ] && echo EXISTS || echo MISSING"`
+  );
+  return stdout.trim() === "EXISTS";
 };
 
-// ✅ Helper: Fetch the latest Frida version from GitHub API
+// Helper: Detect an existing working folder (adirf*) in /data/local/tmp
+// Also detect the binary file name inside that folder.
+const detectWorkingFolder = async () => {
+  try {
+    const { stdout } = await KernelSU.exec(
+      `su -c "ls /data/local/tmp | grep '^adirf'"`
+    );
+    const folders = stdout.split("\n").map(f => f.trim()).filter(f => f);
+    if (folders.length > 0) {
+      // Use the first found folder, e.g. "adirf27041"
+      const folderName = folders[0];
+      workingFolder = `/data/local/tmp/${folderName}`;
+      currentPort = folderName.replace(/^adirf/, "");
+      
+      // List the files inside the working folder:
+      const { stdout: filesOut } = await KernelSU.exec(`su -c "ls '${workingFolder}'"`);
+      const files = filesOut.split("\n").map(f => f.trim()).filter(f => f);
+      currentServerName = files.length > 0 ? files[0] : "frida-server";
+      
+      // Update the input fields to reflect the detected configuration.
+      fridaPortInput.value = currentPort;
+      fridaNameInput.value = currentServerName;
+      log(`Detected working folder: ${workingFolder} with server name: ${currentServerName}`);
+      return true;
+    }
+  } catch (error) {
+    log(`Error detecting working folder: ${error}`);
+  }
+  return false;
+};
+
+// Helper: Create (or update) the working folder using the input values.
+// This folder will be named /data/local/tmp/adirf<port>
+const createWorkingFolder = async () => {
+  currentPort = fridaPortInput.value.trim() || "27042";
+  currentServerName = fridaNameInput.value.trim() || "frida-server";
+  const folderName = `adirf${currentPort}`;
+  workingFolder = `/data/local/tmp/${folderName}`;
+  await KernelSU.exec(`su -c "mkdir -p '${workingFolder}'"`);
+  log(`Using working folder: ${workingFolder}`);
+  return workingFolder;
+};
+
+// Helper: Move the frida binary from the current folder to a new one.
+// (This is used when the port changes.)
+const renameWorkingFolder = async (newFolder) => {
+  if (!workingFolder) {
+    await createWorkingFolder();
+    return;
+  }
+  if (workingFolder !== newFolder) {
+    log(`Port changed. Renaming working folder from ${workingFolder} to ${newFolder}...`);
+    await KernelSU.exec(`su -c "mv '${workingFolder}' '${newFolder}'"`);
+    workingFolder = newFolder;
+    currentPort = newFolder.replace("/data/local/tmp/adirf", "");
+    log(`Working folder renamed to ${workingFolder}`);
+  }
+};
+
+// Helper: Rename the binary inside the working folder if the server name changes.
+const renameServerBinary = async (newServerName) => {
+  const oldBinaryPath = `${workingFolder}/${currentServerName}`;
+  const newBinaryPath = `${workingFolder}/${newServerName}`;
+  if (currentServerName !== newServerName) {
+    log(`Renaming binary from ${oldBinaryPath} to ${newBinaryPath}...`);
+    if (await checkFileExists(oldBinaryPath)) {
+      await KernelSU.exec(`su -c "mv '${oldBinaryPath}' '${newBinaryPath}'"`);
+      await KernelSU.exec(`su -c "chmod +x '${newBinaryPath}'"`);
+      currentServerName = newServerName;
+      log(`Binary renamed to ${newServerName}`);
+    } else {
+      log("Old binary not found; cannot rename binary.");
+    }
+  } else {
+    log("Server name unchanged; no renaming needed.");
+  }
+};
+
+// Helper: Fetch the latest Frida version from GitHub API
 const fetchLatestFridaVersion = async () => {
-    try {
-        const response = await fetch("https://api.github.com/repos/frida/frida/releases/latest");
-        const data = await response.json();
-        return data.tag_name || null;
-    } catch (error) {
-        log(`❌ Error fetching latest Frida version: ${error}`);
-        return null;
-    }
+  try {
+    const response = await fetch("https://api.github.com/repos/frida/frida/releases/latest");
+    const data = await response.json();
+    return data.tag_name || null;
+  } catch (error) {
+    log(`❌ Error fetching latest Frida version: ${error}`);
+    return null;
+  }
 };
 
-// ✅ Helper: Download and install Frida server
+// Helper: Download and install frida-server from GitHub.
+// The file is downloaded to /storage/emulated/0/Download as "frida-server(.xz)"
 const downloadAndInstallFrida = async (version, forceDownload = false) => {
-    const downloadDir = "/storage/emulated/0/Download";
-    const tmpDir = "/data/local/tmp";
-    const binaryName = "frida-server";
-    const downloadPath = `${downloadDir}/${binaryName}`;
-    const fridaPath = `${tmpDir}/${binaryName}`;
+  const downloadDir = "/storage/emulated/0/Download";
+  const defaultBinaryName = "frida-server"; // downloaded file name in Downloads
+  const downloadPath = `${downloadDir}/${defaultBinaryName}`;
+  const downloadedXZPath = `${downloadPath}.xz`;
+  // Ensure the download directory exists
+  await KernelSU.exec(`su -c "mkdir -p '${downloadDir}'"`);
+  if (forceDownload || !(await checkFileExists(downloadPath))) {
+    log("⬇️ Downloading Frida server...");
     const downloadUrl = `https://github.com/frida/frida/releases/download/${version}/frida-server-${version}-android-arm64.xz`;
-
-    // Ensure the download directory exists
-    await KernelSU.exec(`mkdir -p ${downloadDir}`);
-
-    // Download if forced or if file isn't already in the Download directory
-    if (forceDownload || !(await checkFileExists(downloadPath))) {
-        log("⬇️ Downloading Frida server...");
-        // Download the file to Download directory as .xz
-        await KernelSU.exec(`su -c busybox wget --no-check-certificate -qO ${downloadPath}.xz "${downloadUrl}"`);
-
-        // Check if the file exists and is non-empty.
-        // If you suspect the size check is causing issues, you might try "-f" instead of "-s".
-        const { stdout: status } = await KernelSU.exec(`su -c [ -s ${downloadPath}.xz ] && echo "OK" || echo "FAIL"`);
-        log(`Debug: Download file status check output: "${status.trim()}"`);
-        if (status.trim() !== "OK") {
-            throw new Error("Frida download failed!");
-        }
-        // Decompress the downloaded file and set it as executable
-        await KernelSU.exec(`su -c xz -d ${downloadPath}.xz`);
-        await KernelSU.exec(`su -c chmod +x ${downloadPath}`);
-        log("✅ Frida server downloaded and extracted.");
+    await KernelSU.exec(`su -c "busybox wget --no-check-certificate -qO '${downloadedXZPath}' '${downloadUrl}'"`);
+    const { stdout: status } = await KernelSU.exec(
+      `su -c "[ -s '${downloadedXZPath}' ] && echo OK || echo FAIL"`
+    );
+    log(`Debug: Download file status: "${status.trim()}"`);
+    if (status.trim() !== "OK") {
+      throw new Error("Frida download failed!");
     }
-    // Copy to /data/local/tmp and set permissions
-    await KernelSU.exec(`su -c cp -f ${downloadPath} ${fridaPath}`);
-    await KernelSU.exec(`su -c chmod +x ${fridaPath}`);
-    log("✅ Frida installed to /data/local/tmp.");
+    await KernelSU.exec(`su -c "busybox unxz '${downloadedXZPath}'"`);
+    await KernelSU.exec(`su -c "chmod +x '${downloadPath}'"`);
+    log("✅ Frida server downloaded and extracted.");
+  }
+  return downloadPath;
 };
 
+// Apply new configuration (rename or port change).
+// This function renames the working folder and/or the binary using move (mv).
+const applyConfiguration = async () => {
+  if (toggleSwitch.checked) {
+    alert("Please stop the server before changing configuration.");
+    return;
+  }
+  const newPort = fridaPortInput.value.trim() || "27042";
+  const newServerName = fridaNameInput.value.trim() || "frida-server";
+  const newFolder = `/data/local/tmp/adirf${newPort}`;
 
-// ✅ Check if Frida is running
-const checkFridaStatus = async () => {
-    try {
-        const { stdout } = await KernelSU.exec("ps -A | grep frida-server");
-        const isRunning = !!stdout && stdout.trim().length > 0;
-        statusElement.innerText = isRunning ? "✅ Frida Running" : "❌ Frida Stopped";
-        toggleSwitch.checked = isRunning;
-    } catch {
-        statusElement.innerText = "❌ Error checking Frida!";
-        toggleSwitch.checked = false;
-    }
+  // Rename the working folder if the port has changed.
+  await renameWorkingFolder(newFolder);
+
+  // Rename the binary inside the working folder if the server name has changed.
+  await renameServerBinary(newServerName);
 };
 
-// ✅ Toggle Frida On/Off
-const toggleFrida = async () => {
-    const port = document.getElementById("fridaPort").value.trim() || "27042";
-    try {
-        if (toggleSwitch.checked) {
-            // await KernelSU.exec(`cp -f /data/adb/modules/kernelsu-frida/frida-server /data/local/tmp/frida-server`);
-            // await KernelSU.exec(`chmod 755 /data/local/tmp/frida-server`);
-            await KernelSU.exec(`/data/local/tmp/frida-server -D -l 0.0.0.0:${port} &`);
-        } else {
-            await KernelSU.exec("pkill -f frida-server");
-        }
-        // Wait a moment before re-checking status
-        await new Promise((resolve) => setTimeout(resolve, 1000));
-        checkFridaStatus();
-    } catch (error) {
-        alert("❌ Failed to toggle Frida: " + error);
-        toggleSwitch.checked = !toggleSwitch.checked;
-    }
-};
-
-// ✅ Initialize Frida (Check & Download if Needed)
+// Initialize Frida:
+// 1. Check for a working folder in /data/local/tmp (adirf*).
+// 2. If none exists, create one based on the input fields.
+// 3. Then, if a frida-server binary exists in the working folder, do nothing.
+//    Otherwise, check if one exists in /Downloads and move it; if not, download it.
 const initializeFrida = async () => {
-    log("🔍 Checking if Frida is installed...");
-    const tmpDir = "/data/local/tmp";
-    const binaryName = "frida-server";
-    const fridaPath = `${tmpDir}/${binaryName}`;
-    const downloadDir = "/storage/emulated/0/Download";
-    const downloadPath = `${downloadDir}/${binaryName}`;
-    const downloadedXZPath = `${downloadPath}.xz`;
-
-    try {
-        if (await checkFileExists(fridaPath)) {
-            log("✅ Frida already installed in /data/local/tmp!");
-            return;
-        }
-        // Check if the downloaded .xz file exists
-        if (await checkFileExists(downloadedXZPath)) {
-            log("📡 Found downloaded Frida in Download directory. Unzipping and copying...");
-            // Run unxz command with proper quoting
-            const { stdout, stderr } = await KernelSU.exec(
-                `su -c "busybox unxz '${downloadedXZPath}'"`
-            );
-            log(`unxz stdout: ${stdout}\nunxz stderr: ${stderr}`);
-
-            // Verify that unxz produced the expected file (downloadPath without the .xz extension)
-            if (!(await checkFileExists(downloadPath))) {
-                log("❌ Unxz command did not create the expected file.");
-                return;
-            }
-            await KernelSU.exec(`su -c cp -f "${downloadPath}" "${fridaPath}"`);
-            await KernelSU.exec(`su -c chmod +x "${fridaPath}"`);
-            log("✅ Frida copied to /data/local/tmp.");
-            return;
-        }
-        // Not found—fetch and install the latest version
-        log("⬇️ Fetching latest Frida version...");
-        const latestVersion = await fetchLatestFridaVersion();
-        if (!latestVersion) {
-            log("❌ Failed to get latest Frida version!");
-            return;
-        }
-        log(`📡 Latest Frida Version: ${latestVersion}`);
-        await downloadAndInstallFrida(latestVersion);
-    } catch (error) {
-        log(`❌ Error initializing Frida: ${error}`);
-    }
+  log("🔍 Initializing Frida...");
+  const detected = await detectWorkingFolder();
+  if (!detected) {
+    await createWorkingFolder();
+  }
+  const binaryPath = `${workingFolder}/${(currentServerName || "frida-server")}`;
+  if (await checkFileExists(binaryPath)) {
+    log(`✅ Frida binary found in ${workingFolder}`);
+    fridaNameInput.value = currentServerName;
+    fridaPortInput.value = currentPort;
+    return;
+  }
+  // If no binary in working folder, check Downloads.
+  const downloadPath = "/storage/emulated/0/Download/frida-server";
+  if (await checkFileExists(downloadPath)) {
+    log(`📡 Found frida-server in Downloads. Moving it to ${workingFolder}...`);
+    await KernelSU.exec(`su -c "mv '${downloadPath}' '${workingFolder}/frida-server'"`);
+    await KernelSU.exec(`su -c "chmod +x '${workingFolder}/frida-server'"`);
+    currentServerName = "frida-server";
+    fridaNameInput.value = currentServerName;
+    return;
+  }
+  // Otherwise, fetch and install the latest version.
+  log("⬇️ Fetching latest Frida version...");
+  const latestVersion = await fetchLatestFridaVersion();
+  if (!latestVersion) {
+    log("❌ Failed to get latest Frida version!");
+    return;
+  }
+  log(`📡 Latest Frida Version: ${latestVersion}`);
+  const downloadedPath = await downloadAndInstallFrida(latestVersion);
+  await KernelSU.exec(`su -c "mv '${downloadedPath}' '${workingFolder}/frida-server'"`);
+  await KernelSU.exec(`su -c "chmod +x '${workingFolder}/frida-server'"`);
+  currentServerName = "frida-server";
+  fridaNameInput.value = currentServerName;
 };
 
+// Check Frida status using ps -A and grep for the current server name.
+const checkFridaStatus = async () => {
+  const binaryName = currentServerName || "frida-server";
+  try {
+    const { stdout } = await KernelSU.exec(`su -c "ps -A | grep '${binaryName}'"`);
+    log(`Debug: ps output: ${stdout}`);
+    const isRunning = stdout && stdout.trim().length > 0;
+    statusElement.innerText = isRunning ? "✅ Frida Running" : "❌ Frida Stopped";
+    toggleSwitch.checked = isRunning;
+    // Disable input fields when the server is running.
+    fridaNameInput.disabled = isRunning;
+    fridaPortInput.disabled = isRunning;
+  } catch (error) {
+    statusElement.innerText = "❌ Error checking Frida!";
+    toggleSwitch.checked = false;
+  }
+};
 
-// ✅ Check Frida Version (both current and latest)
+// Toggle Frida on/off.
+// If toggling on, start the server using the binary in the working folder.
+// If toggling off, kill the server.
+const toggleFrida = async () => {
+  const port = fridaPortInput.value.trim() || "27042";
+  const serverName = fridaNameInput.value.trim() || "frida-server";
+  const newFolder = `/data/local/tmp/adirf${port}`;
+  // Ensure the working folder is up-to-date if the port changed.
+  if (workingFolder !== newFolder) {
+    log(`Port changed. Renaming working folder to ${newFolder}...`);
+    await renameWorkingFolder(newFolder);
+  }
+  const binaryPath = `${newFolder}/${serverName}`;
+  try {
+    if (toggleSwitch.checked) {
+      // Start the server
+      await KernelSU.exec(`su -c "${binaryPath} -D -l 0.0.0.0:${port} &"`);
+      log("Started Frida server.");
+    } else {
+      // Stop the server (kill by matching the binary path)
+      await KernelSU.exec(`su -c "pkill -f '${binaryPath}'"`);
+      log("Stopped Frida server.");
+    }
+    // Allow a short delay for state to settle.
+    await new Promise(resolve => setTimeout(resolve, 1500));
+    await checkFridaStatus();
+  } catch (error) {
+    alert("❌ Failed to toggle Frida: " + error);
+    toggleSwitch.checked = !toggleSwitch.checked;
+  }
+};
+
+// Check Frida version and update UI.
 const checkFridaVersion = async () => {
-    const currentVersionElement = document.getElementById("currentVersion");
-    const latestVersionElement = document.getElementById("latestVersion");
-
-    try {
-        const { stdout } = await KernelSU.exec("/data/local/tmp/frida-server --version");
-        currentVersionElement.innerText = stdout.trim() || "Unknown";
-    } catch {
-        currentVersionElement.innerText = "Not Installed";
-    }
-
-    const latestVersion = await fetchLatestFridaVersion();
-    latestVersionElement.innerText = latestVersion || "Error Fetching Version";
+  const currentVersionElement = document.getElementById("currentVersion");
+  const latestVersionElement  = document.getElementById("latestVersion");
+  if (!workingFolder) {
+    currentVersionElement.innerText = "Not Installed";
+    return;
+  }
+  const binaryPath = `${workingFolder}/${(currentServerName || "frida-server")}`;
+  try {
+    const { stdout } = await KernelSU.exec(`su -c "${binaryPath} --version"`);
+    currentVersionElement.innerText = stdout.trim() || "Unknown";
+  } catch {
+    currentVersionElement.innerText = "Not Installed";
+  }
+  const latestVersion = await fetchLatestFridaVersion();
+  latestVersionElement.innerText = latestVersion || "Error Fetching Version";
 };
 
-// ✅ Update Frida (force download & install)
-const updateFrida = async () => {
-    const latestVersion = document.getElementById("latestVersion").innerText;
-    if (latestVersion === "Error Fetching" || latestVersion === "Unknown") {
-        log("❌ Unable to check latest version!");
-        return;
-    }
-    if (!confirm(`A new Frida version (${latestVersion}) is available. Update now?`)) return;
-    try {
-        log("⬇️ Downloading Frida update...");
-        await downloadAndInstallFrida(latestVersion, true);
-        log(`✅ Frida updated to ${latestVersion}`);
-        checkFridaVersion();
-    } catch (error) {
-        log(`❌ Failed to update Frida: ${error}`);
-    }
-};
-
-// ✅ Run checks on page load
-document.addEventListener("DOMContentLoaded", () => {
-    log("🟢 WebView Loaded: Running Initial Checks...");
-    initializeFrida();
-    checkFridaStatus();
-    checkFridaVersion();
+// On page load, initialize and check status and version.
+document.addEventListener("DOMContentLoaded", async () => {
+  log("🟢 Module launched: initializing...");
+  await initializeFrida();
+  await checkFridaStatus();
+  await checkFridaVersion();
 });
 
-// ✅ Attach event listeners
-document.getElementById("fridaToggle").addEventListener("change", toggleFrida);
-document.getElementById("updateFrida").addEventListener("click", updateFrida);
+// Attach event listeners.
+toggleSwitch.addEventListener("change", toggleFrida);
+document.getElementById("updateFrida").addEventListener("click", async () => {
+  if (toggleSwitch.checked) {
+    alert("Please stop the server before updating.");
+    return;
+  }
+  const latestVersion = await fetchLatestFridaVersion();
+  if (!latestVersion) {
+    log("❌ Could not fetch latest Frida version.");
+    return;
+  }
+  log(`⬇️ Updating Frida to ${latestVersion}...`);
+  const downloadedPath = await downloadAndInstallFrida(latestVersion, true);
+  await KernelSU.exec(`su -c "mv '${downloadedPath}' '${workingFolder}/frida-server'"`);
+  await KernelSU.exec(`su -c "chmod +x '${workingFolder}/frida-server'"`);
+  log(`✅ Frida updated to ${latestVersion}`);
+  await checkFridaVersion();
+});
+
+fridaNameInput.addEventListener("blur", async () => {
+    if (!toggleSwitch.checked) {
+      await applyConfiguration();
+    }
+  });
+  fridaPortInput.addEventListener("blur", async () => {
+    if (!toggleSwitch.checked) {
+      await applyConfiguration();
+    }
+  });
+  
